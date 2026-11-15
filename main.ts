@@ -44,8 +44,6 @@ const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
 
 const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
 const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
-/** Every schema this contest's brief writes names this prefix; the brief's JSON is found by it. */
-const SCHEMA_PREFIX = 'free-model-aggregator-02/';
 /** The public base URL of the provider the free models belong to: the endpoint the gateway reaches. */
 const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
 /** The environment variable an entrant's OpenRouter key is pushed under (an entry secret). */
@@ -133,111 +131,95 @@ interface Failure {
   model: string | null;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
-  }
-  return out;
-}
-
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
+/**
+ * The JSON document in `text` whose `schema` member is `schema`, parsed. The brief writes each
+ * document as one object that opens with its schema, so the document is found by the schema string
+ * itself: the brace just before it opens the object, and the matching brace closes it. String
+ * contents are skipped while the braces are counted, so a brace inside a string never ends the doc.
+ */
+function docWithSchema(text: string, schema: string): Json | null {
+  const marker = text.indexOf(schema);
+  if (marker < 0) return null;
+  const open = text.lastIndexOf('{', marker);
+  if (open < 0) return null;
+  if (!/^\s*"schema"\s*:\s*"$/.test(text.slice(open + 1, marker))) return null;
   let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
+  let quoted = false;
+  for (let i = open; i < text.length; i++) {
     const ch = text[i];
-    if (inString) {
+    if (quoted) {
       if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') {
+      quoted = true;
+      continue;
+    }
+    if (ch === '{') depth += 1;
     else if (ch === '}') {
       depth -= 1;
-      if (depth === 0) return i;
+      if (depth === 0) {
+        try {
+          const parsed: unknown = JSON.parse(text.slice(open, i + 1));
+          return isRecord(parsed) ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
     }
-  }
-  return -1;
-}
-
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-/**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
- */
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
-  for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
   }
   return null;
 }
 
 /**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
+ * One model row, normalised. The id comes from the row's `id`, or its `model` under the provider
+ * that names it: a bare OpenRouter id (`vendor/model:free`) naming `openrouter` is routed as the
+ * gateway spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free
+ * unless it says `free: false`; a paid row is never routed.
  */
-function modelOf(v: unknown): ModelRow | null {
+function asModelRow(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
+  const raw = typeof v.id === 'string' && v.id !== '' ? v.id : typeof v.model === 'string' ? v.model : '';
   if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
-  const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
+  const providerName =
+    typeof v.provider === 'string' && v.provider !== '' ? v.provider : typeof v.wire === 'string' ? v.wire : 'openrouter';
+  const id = providerName === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
+  const num = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? x : null);
+  const flag = (x: unknown): boolean | null => (typeof x === 'boolean' ? x : null);
   return {
     id,
-    provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    provider: providerName,
+    display_name: typeof v.display_name === 'string' && v.display_name !== '' ? v.display_name : raw,
+    rating_milli: num(v.rating_milli) ?? 0,
+    context_length: num(v.context_length),
+    tools: flag(v.tools),
+    vision: flag(v.vision),
+    json: flag(v.json),
     free: v.free !== false,
   };
 }
 
-function promptOf(v: unknown): PromptRow | null {
+/** One prompt row, normalised: only the requirements the brief actually sets are kept. */
+function asPromptRow(v: unknown): PromptRow | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
+  if (typeof v.id !== 'string' || v.id === '') return null;
+  const req = isRecord(v.requires) ? v.requires : {};
+  const needs: Requirement = {};
+  if (req.tools === true) needs.tools = true;
+  if (req.vision === true) needs.vision = true;
+  if (req.json === true) needs.json = true;
+  if (typeof req.min_context === 'number' && Number.isFinite(req.min_context)) needs.min_context = req.min_context;
   return {
-    id,
+    id: v.id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
     stream: v.stream === true,
     weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    requires: needs,
   };
 }
 
-/** The brief at `path`, its two documents found under this contest's schema prefix. */
+/** The brief at `path`: the free model list and the six prompts, each found by its own schema. */
 function readBrief(path: string): Brief {
   if (path === '') return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set' };
   let text: string;
@@ -246,23 +228,28 @@ function readBrief(path: string): Brief {
   } catch (err) {
     return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
+  const modelsDoc = docWithSchema(text, MODELS_SCHEMA);
   if (modelsDoc === null) {
     return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
   }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
+  // A brief may spell the model list `models` or `ratings` (the sibling contest's name).
+  const rows = Array.isArray(modelsDoc.models) ? modelsDoc.models : Array.isArray(modelsDoc.ratings) ? modelsDoc.ratings : [];
+  const models: ModelRow[] = [];
+  for (const row of rows) {
+    const m = asModelRow(row);
+    if (m !== null) models.push(m);
+  }
+  const promptsDoc = docWithSchema(text, PROMPTS_SCHEMA);
   if (promptsDoc === null) {
     return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
   }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
+  // A brief may spell the prompt list `prompts` or `manifest` (the sibling contest's name).
+  const prows = Array.isArray(promptsDoc.prompts) ? promptsDoc.prompts : Array.isArray(promptsDoc.manifest) ? promptsDoc.manifest : [];
+  const prompts: PromptRow[] = [];
+  for (const row of prows) {
+    const p = asPromptRow(row);
+    if (p !== null) prompts.push(p);
+  }
   return { models, prompts, error: null };
 }
 
@@ -375,49 +362,17 @@ function openAIError(message: string, type: string, code: string | null): Json {
   return { error: { message, type, code } };
 }
 
-/** The text of a string or of a block array's text blocks; '' when there is none. */
-function textOf(content: unknown): string {
+/** The text carried by a message body: a plain string, or its text blocks joined. */
+function blockText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
-}
-
-/** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
-function partOf(block: Json): Json | null {
-  if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
-  if (block.type === 'image' && isRecord(block.source)) {
-    const source = block.source;
-    if (source.type === 'base64' && typeof source.data === 'string') {
-      const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
-      return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
-    }
-    if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
-  }
-  return null;
-}
-
-/** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const text = textOf(content);
-    return text !== '' ? text : JSON.stringify(content);
-  }
-  return content === undefined ? '' : JSON.stringify(content);
-}
-
-/** A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one. */
-function argumentsOf(value: unknown): Json {
-  if (isRecord(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isRecord(parsed)) return parsed;
-    } catch {
-      // Not JSON: an empty input.
+  let out = '';
+  for (const block of content) {
+    if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') {
+      out += (out === '' ? '' : '\n') + block.text;
     }
   }
-  return {};
+  return out;
 }
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
@@ -433,30 +388,29 @@ function numberOrZero(value: unknown): number {
 }
 
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
- * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
- * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
- * output cap, temperature, top_p, stop sequences and streaming pass through.
+ * An Anthropic Messages request as the Chat Completions request the gateway routes, naming `model`:
+ * the system prompt becomes the first system message, image blocks become image_url parts, tool_use
+ * blocks become tool_calls on the assistant message, tool_result blocks become tool messages, and
+ * tools, tool_choice, the output cap, temperature, top_p, stop sequences and streaming carry over.
  */
-function anthropicToOpenAI(body: Json, model: string): Json {
+function anthropicRequestToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
-  const system = textOf(body.system);
+  const system = blockText(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
   const source = Array.isArray(body.messages) ? body.messages : [];
   for (const raw of source) {
     if (!isRecord(raw)) continue;
-    const assistant = raw.role === 'assistant';
     const content = raw.content;
     if (typeof content === 'string') {
-      messages.push({ role: assistant ? 'assistant' : 'user', content });
+      messages.push({ role: raw.role === 'assistant' ? 'assistant' : 'user', content });
       continue;
     }
     if (!Array.isArray(content)) continue;
-    if (assistant) {
-      const toolCalls: Json[] = [];
+    if (raw.role === 'assistant') {
+      const calls: Json[] = [];
       for (const block of content) {
         if (!isRecord(block) || block.type !== 'tool_use') continue;
-        toolCalls.push({
+        calls.push({
           id: typeof block.id === 'string' ? block.id : '',
           type: 'function',
           function: {
@@ -465,27 +419,45 @@ function anthropicToOpenAI(body: Json, model: string): Json {
           },
         });
       }
-      const text = textOf(content);
-      messages.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
+      const text = blockText(content);
+      const msg: Json = { role: 'assistant', content: text === '' ? null : text };
+      if (calls.length > 0) msg.tool_calls = calls;
+      messages.push(msg);
       continue;
     }
     const parts: Json[] = [];
     for (const block of content) {
       if (!isRecord(block)) continue;
       if (block.type === 'tool_result') {
+        const inner = block.content;
+        let text: string;
+        if (typeof inner === 'string') text = inner;
+        else if (Array.isArray(inner)) {
+          const t = blockText(inner);
+          text = t === '' ? JSON.stringify(inner) : t;
+        } else text = inner === undefined ? '' : JSON.stringify(inner);
         messages.push({
           role: 'tool',
           tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
+          content: text,
         });
         continue;
       }
-      const part = partOf(block);
-      if (part !== null) parts.push(part);
+      if (block.type === 'text' && typeof block.text === 'string') {
+        parts.push({ type: 'text', text: block.text });
+        continue;
+      }
+      if (block.type === 'image' && isRecord(block.source)) {
+        const src = block.source;
+        if (src.type === 'base64' && typeof src.data === 'string') {
+          parts.push({
+            type: 'image_url',
+            image_url: { url: `data:${typeof src.media_type === 'string' ? src.media_type : 'image/png'};base64,${src.data}` },
+          });
+        } else if (src.type === 'url' && typeof src.url === 'string') {
+          parts.push({ type: 'image_url', image_url: { url: src.url } });
+        }
+      }
     }
     if (parts.length > 0) messages.push({ role: 'user', content: parts });
   }
@@ -496,19 +468,18 @@ function anthropicToOpenAI(body: Json, model: string): Json {
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
   if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
-      return [
-        {
-          type: 'function',
-          function: {
-            name: raw.name,
-            description: typeof raw.description === 'string' ? raw.description : '',
-            parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-          },
+    const tools: Json[] = [];
+    for (const raw of body.tools) {
+      if (!isRecord(raw) || typeof raw.name !== 'string') continue;
+      tools.push({
+        type: 'function',
+        function: {
+          name: raw.name,
+          description: typeof raw.description === 'string' ? raw.description : '',
+          parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
         },
-      ];
-    });
+      });
+    }
     if (tools.length > 0) out.tools = tools;
   }
   const choice = body.tool_choice;
@@ -525,21 +496,32 @@ function anthropicToOpenAI(body: Json, model: string): Json {
 }
 
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-function openAIToAnthropic(body: Json, model: string): Json {
+function openAIResponseToAnthropic(body: Json, model: string): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const text = typeof message.content === 'string' ? message.content : blockText(message.content);
   if (text !== '') content.push({ type: 'text', text });
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const call of calls) {
     if (!isRecord(call) || !isRecord(call.function)) continue;
+    let input: Json = {};
+    const args = call.function.arguments;
+    if (isRecord(args)) input = args;
+    else if (typeof args === 'string' && args.trim() !== '') {
+      try {
+        const parsed: unknown = JSON.parse(args);
+        if (isRecord(parsed)) input = parsed;
+      } catch {
+        // Not JSON: an empty input.
+      }
+    }
     content.push({
       type: 'tool_use',
       id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
       name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
+      input,
     });
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
@@ -965,7 +947,7 @@ function requirementsFromBody(body: Json): Requirement {
  * gateway accepts is ever exceeded; a streamed request asks for its usage on the last chunk.
  */
 function buildUpstreamBody(body: Json, wire: 'openai' | 'anthropic', model: string): Json {
-  const out = wire === 'anthropic' ? anthropicToOpenAI(body, model) : { ...body, model };
+  const out = wire === 'anthropic' ? anthropicRequestToOpenAI(body, model) : { ...body, model };
   if (typeof out.max_tokens !== 'number' && typeof out.max_completion_tokens !== 'number') out.max_tokens = DEFAULT_MAX_TOKENS;
   if (typeof out.max_tokens === 'number') out.max_tokens = Math.min(out.max_tokens, MAX_TOKENS_CAP);
   if (typeof out.max_completion_tokens === 'number') out.max_completion_tokens = Math.min(out.max_completion_tokens, MAX_TOKENS_CAP);
@@ -1027,7 +1009,7 @@ async function handleCompletion(req: IncomingMessage, res: ServerResponse, wire:
       continue;
     }
     if (wire === 'openai') sendJson(res, 200, openAIJsonWithModel(answer, candidate.id), failures);
-    else sendJson(res, 200, openAIToAnthropic(answer, candidate.id), failures);
+    else sendJson(res, 200, openAIResponseToAnthropic(answer, candidate.id), failures);
     return;
   }
   return sendError(res, wire, 503, 'all_models_refused', 'every free model that meets this request refused the gateway call', failures);
